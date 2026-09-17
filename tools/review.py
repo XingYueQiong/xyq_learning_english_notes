@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-艾宾浩斯记忆曲线复习提醒
-========================
-按记忆曲线算出「今天该复习哪些内容」，并把要复习的内容直接打印出来。
+艾宾浩斯复习提醒（跑一次 = 当天已学）
+=====================================
+每天跑一次这个脚本，它就会：
+    1. 把「今天该复习的内容」完整打印出来（这就是你今天的复习任务）；
+    2. 顺手把今天这些内容记为「今天已复习」，明天不会再重复提醒；
+    3. 把「逾期没复习」的内容整理成一张表格（同时写入 复习逾期清单.md）。
 
 复习时间的两种来源
 ------------------
@@ -17,30 +20,36 @@
        又一段新内容……
 
    脚本会把「日期标记」到「下一个日期标记」之间的内容视为一个内容块，
-   单独计算复习时间。所以你给新增内容标上日期，它就会自动进入复习计划。
-   支持格式：2026年9月15日18:02:27 / 2026年9月15日 / 2026-09-15
+   单独计算复习时间。支持格式：2026年9月15日18:02:27 / 2026年9月15日 / 2026-09-15
 
 2. git 提交时间（用于没有日期标记的文件，如 Word/、2026_daily_record/）
    每个文件每次提交视为一次学习，按提交日期排复习。
 
+复习间隔怎么算（晚一天复习也不会堆积）
+--------------------------------------
+第 1 轮：学习日 + 1 天
+第 2 轮：第 1 轮实际复习日 + 1 天
+第 3 轮：第 2 轮实际复习日 + 2 天
+第 4 轮：第 3 轮实际复习日 + 3 天 …… 依此类推（间隔 = INTERVALS 相邻两项之差）
+
+也就是说：按时复习时，复习日正好是学习日 +1、+2、+4、+7、+15、+30、+60、+120 天；
+偶尔漏了一天，后面的安排会自动顺延，不会一次冒出好几轮。
+
 用法（在仓库根目录执行）：
-    python tools/review.py                    # 查看今天要复习的内容
-    python tools/review.py --done             # 复习完成后标记今天全部完成
-    python tools/review.py --done 1,3         # 只标记第 1、3 项
-    python tools/review.py --upcoming 14      # 查看未来 14 天的复习安排
-    python tools/review.py --status           # 查看每个文件 / 内容块的下次复习时间
-    python tools/review.py --markers          # 列出识别到的所有日期标记（检查格式用）
-    python tools/review.py --stamp            # 打印当前时间的标记文本，方便粘贴进笔记
-    python tools/review.py --full             # 显示完整内容，不截断
+    python tools/review.py                    # 今天的复习内容（并记为已复习）
+    python tools/review.py --no-mark          # 只看，不记录
+    python tools/review.py --catch-up         # 把逾期清单里的内容全部记为「已补复习」
+    python tools/review.py --done 1,3         # 只把今天第 1、3 项记为已复习
+    python tools/review.py --upcoming 14      # 未来 14 天还会复习哪些
+    python tools/review.py --status           # 每段内容下一轮复习的时间
+    python tools/review.py --markers          # 列出识别到的日期标记（检查格式用）
+    python tools/review.py --stamp            # 打印当前时间戳，方便粘贴进笔记
+    python tools/review.py --full             # 内容完整显示，不截断
     python tools/review.py --reset            # 清空复习记录，重新开始
     python tools/review.py --date 2026-09-20  # 假装今天是某一天（测试用）
 
-原理：
-    1. 有日期标记的文件：按标记把文件切成内容块，每块按标记日期 + 艾宾浩斯曲线排复习；
-    2. 没有日期标记的文件：用 `git log --name-status` 的提交日期排复习；
-    3. 复习过的记录在 .review_state.json，不会重复提醒。
-
-注意：改了文件记得 commit（或至少写上日期标记），脚本才知道有新东西要复习。
+复习进度保存在 .review_state.json；逾期清单会写到 复习逾期清单.md。
+注意：改了文件记得 commit（或给新内容写上日期标记），脚本才知道有新东西要复习。
 """
 
 import argparse
@@ -72,8 +81,8 @@ DATE_MARKER_RE = re.compile(
     r")?"
 )
 
-# 每项变更内容默认最多显示多少行
-PREVIEW_LINES = 25
+# 每项内容默认最多显示多少行（详细展示今天的内容时）
+PREVIEW_LINES = 40
 
 # --upcoming 默认预览多少天
 DEFAULT_UPCOMING = 7
@@ -81,9 +90,16 @@ DEFAULT_UPCOMING = 7
 # 复习记录文件名（存放在仓库根目录，已加入 .gitignore）
 STATE_FILE = ".review_state.json"
 
+# 逾期清单文件名（每次运行都会重新生成，内容为空则删除该文件）
+OVERDUE_FILE = "复习逾期清单.md"
+
+# 逾期表格里文件名 / 位置列的宽度
+TABLE_PATH_WIDTH = 34
+TABLE_LOC_WIDTH = 24
+
 # 不纳入复习计划的目录 / 文件 / 后缀
 IGNORE_DIRS = {".git", ".vscode", ".github", ".idea", "__pycache__", "tools", "scripts"}
-IGNORE_FILES = {".gitignore", "README.md", STATE_FILE}
+IGNORE_FILES = {".gitignore", "README.md", STATE_FILE, OVERDUE_FILE}
 IGNORE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".svg",
     ".pdf", ".zip", ".7z", ".rar", ".exe", ".dll", ".mp3", ".mp4",
@@ -418,81 +434,69 @@ def save_state(state: Dict[str, object]) -> None:
     )
 
 
-def item_key(path: str, day_str: str, interval: int) -> str:
-    return "%s@%s#%d" % (path, day_str, interval)
+def content_key(path: str, anchor: str, interval: int) -> str:
+    """复习记录里的一项：文件 + 内容标识 + 第几轮对应的间隔。"""
+    return "%s@%s#%d" % (path, anchor, interval)
 
 
-# ==================== 生成复习计划 ====================
+# ==================== 复习计划 ====================
 
 
-class ReviewItem(object):
-    __slots__ = (
-        "path", "learned", "interval", "due", "key", "kind",
-        "block", "commits", "index", "content",
-    )
+class Anchor(object):
+    """一段可复习的内容：文件里的一个日期块，或某个文件的一次提交。"""
+
+    __slots__ = ("path", "learned", "anchor", "kind", "block", "commits", "content")
 
     def __init__(
         self,
         path: str,
         learned: date,
-        interval: int,
-        key: str,
+        anchor: str,
         kind: str,
         block: Optional[Block] = None,
         commits: Optional[List[str]] = None,
+        content: Optional[List[str]] = None,
     ) -> None:
         self.path = path
-        self.learned = learned
-        self.interval = interval
-        self.due = learned + timedelta(days=interval)
-        self.key = key
-        self.kind = kind                # "block"（文件内日期标记）或 "file"（git 提交）
+        self.learned = learned          # 学习日期
+        self.anchor = anchor            # 内容标识（时间戳 / 提交日期 / head）
+        self.kind = kind                # "block" 或 "file"
         self.block = block
         self.commits = commits or []
-        self.index = 0
-        self.content: Optional[List[str]] = None
+        self.content = content or []    # 这段内容的正文（已去掉空行)
 
-    @property
-    def round_no(self) -> int:
-        return INTERVALS.index(self.interval) + 1
+    def key(self, interval: int) -> str:
+        return content_key(self.path, self.anchor, interval)
 
     @property
     def location(self) -> str:
         if self.block is None:
-            return "整篇内容（按 git 提交时间）"
+            return "整篇（按 git 提交时间）"
         if self.block.start == self.block.end:
-            return "第 %d 行（标记行 %s）" % (self.block.start, self.block.marker_text)
-        return "第 %d-%d 行（标记 %s）" % (
-            self.block.start,
-            self.block.end,
-            self.block.marker_text,
-        )
+            return "第 %d 行" % self.block.start
+        return "第 %d-%d 行" % (self.block.start, self.block.end)
 
 
-def build_all_items(
-    events: Dict[str, Dict[str, List[str]]],
-    blocks: Dict[str, List[Block]],
-    reviewed: Dict[str, str],
-    with_content: bool = False,
-) -> List[ReviewItem]:
-    """所有尚未复习的复习项（含未到期），按到期时间升序。
-    with_content=True 时会顺便取出内容，并丢弃没有任何内容的项（空文件等）。
-    """
-    items: List[ReviewItem] = []
+def build_anchors(
+    events: Dict[str, Dict[str, List[str]]], blocks: Dict[str, List[Block]]
+) -> List[Anchor]:
+    """把「日期块」和「git 提交」统一成一个个可复习的内容单元（跳过空内容）。"""
+    anchors: List[Anchor] = []
     block_paths = set(blocks)
 
-    # 1) 有日期标记的文件：按内容块排（整篇的 git 事件不再参与，避免重复）
+    def add(anchor: Anchor) -> None:
+        if anchor.content:
+            anchors.append(anchor)
+
+    # 1) 有日期标记的文件：每个日期块单独排复习
     for path, blist in blocks.items():
         for block in blist:
-            for interval in INTERVALS:
-                key = "%s#%d" % (block.key, interval)
-                if key in reviewed:
-                    continue
-                items.append(
-                    ReviewItem(path, block.learned, interval, key, "block", block=block)
-                )
+            stamp = block.key.split("@block:", 1)[-1]
+            candidate = Anchor(path, block.learned, "block:%s" % stamp, "block", block=block)
+            candidate.content = [ln for ln in block.lines if ln.strip()]
+            add(candidate)
 
-    # 2) 没有日期标记的文件：按 git 提交日期排
+    # 2) 没有日期标记的文件：按 git 提交日期整篇排复习
     for path, dates in events.items():
         if path in block_paths:
             continue
@@ -501,38 +505,145 @@ def build_all_items(
                 learned = date.fromisoformat(day_str)
             except ValueError:
                 continue
-            for interval in INTERVALS:
-                key = item_key(path, day_str, interval)
-                if key in reviewed:
-                    continue
-                items.append(
-                    ReviewItem(path, learned, interval, key, "file", commits=commits)
-                )
+            candidate = Anchor(path, learned, day_str, "file", commits=commits)
+            candidate.content = anchor_lines(candidate)
+            add(candidate)
 
-    items.sort(key=lambda it: (it.due, it.path, it.learned, it.interval))
+    anchors.sort(key=lambda a: (a.learned, a.path, a.anchor))
+    return anchors
+
+
+def _as_date(value: object) -> Optional[date]:
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+class Schedule(object):
+    """某段内容当前「待复习的那一轮」。"""
+
+    __slots__ = (
+        "anchor", "round_no", "interval", "gap", "due",
+        "overdue_days", "today", "index", "content",
+    )
+
+    def __init__(
+        self,
+        anchor: Anchor,
+        round_no: int,
+        interval: int,
+        gap: int,
+        due: date,
+        today: date,
+    ) -> None:
+        self.anchor = anchor
+        self.round_no = round_no        # 第几轮
+        self.interval = interval        # 这一轮对应的间隔（也是记录用的 key）
+        self.gap = gap                  # 距离上一轮过了几天
+        self.due = due                  # 计划复习日
+        self.today = today
+        self.overdue_days = max(0, (today - due).days)
+        self.index = 0
+        self.content: Optional[List[str]] = None
+
+    @property
+    def path(self) -> str:
+        return self.anchor.path
+
+    @property
+    def learned(self) -> date:
+        return self.anchor.learned
+
+    @property
+    def location(self) -> str:
+        return self.anchor.location
+
+    @property
+    def key(self) -> str:
+        return self.anchor.key(self.interval)
+
+    @property
+    def is_today(self) -> bool:
+        return self.due == self.today
+
+    @property
+    def is_future(self) -> bool:
+        return self.due > self.today
+
+
+def resolve_schedules(
+    anchors: Sequence[Anchor],
+    reviewed: Dict[str, str],
+    today: date,
+    with_content: bool = False,
+) -> List[Schedule]:
+    """
+    算出每段内容当前待复习的那一轮。
+    复习日 = 上一轮「实际」复习日 + 间隔差，所以晚一天复习后面的安排会自动顺延,
+    不会一次冒出好几轮同样的内容。
+    """
+    schedules: List[Schedule] = []
+    for anchor in anchors:
+        done_idx = -1
+        last_done: Optional[date] = None
+        for i, interval in enumerate(INTERVALS):
+            done = _as_date(reviewed.get(anchor.key(interval)))
+            if done is None:
+                break
+            done_idx = i
+            last_done = done
+
+        nxt = done_idx + 1
+        if nxt >= len(INTERVALS):
+            continue  # 所有轮次都复习完了
+
+        prev_interval = INTERVALS[nxt - 1] if nxt > 0 else 0
+        base = last_done if (nxt > 0 and last_done is not None) else anchor.learned
+        gap = INTERVALS[nxt] - prev_interval
+        due = base + timedelta(days=gap)
+        schedules.append(Schedule(anchor, nxt + 1, INTERVALS[nxt], gap, due, today))
+
+    schedules.sort(key=lambda s: (s.due, s.path, s.round_no))
 
     if with_content:
-        kept: List[ReviewItem] = []
-        for item in items:
-            item.content = item_lines(item)
-            if item.content:
-                kept.append(item)
-        items = kept
-    return items
+        kept: List[Schedule] = []
+        for s in schedules:
+            s.content = s.anchor.content
+            if s.content:
+                kept.append(s)
+        schedules = kept
+    return schedules
 
 
-def due_items(items: Sequence[ReviewItem], today: date) -> List[ReviewItem]:
-    return [it for it in items if it.due <= today]
+def future_dues(schedule: Schedule, today: date, days: int) -> List[Tuple[date, int]]:
+    """在「按时复习」的假设下，往后推算这段内容还会有的复习日。"""
+    if schedule.overdue_days:
+        return []  # 已经逾期，后面的时间没法可靠预测
+    result: List[Tuple[date, int]] = []
+    limit = today + timedelta(days=days)
+    due = schedule.due
+    idx = schedule.round_no - 1
+    while idx + 1 < len(INTERVALS):
+        due = due + timedelta(days=INTERVALS[idx + 1] - INTERVALS[idx])
+        idx += 1
+        if due > limit:
+            break
+        result.append((due, idx + 1))
+    return result
 
 
-def upcoming_map(items: Sequence[ReviewItem], today: date, days: int) -> List[Tuple[date, List[str]]]:
+def upcoming_map(
+    schedules: Sequence[Schedule], today: date, days: int
+) -> List[Tuple[date, List[str]]]:
     """未来 days 天内每天有哪些内容要复习。"""
     buckets: Dict[date, List[str]] = {}
-    limit = today + timedelta(days=days)
-    for item in items:
-        if not (today < item.due <= limit):
-            continue
-        buckets.setdefault(item.due, []).append(item.path)
+    for s in schedules:
+        for due, _round_no in future_dues(s, today, days):
+            if due > today:
+                buckets.setdefault(due, []).append(s.path)
     return [(d, paths) for d, paths in sorted(buckets.items())]
 
 
@@ -560,25 +671,22 @@ def read_file_lines(path: str) -> List[str]:
         return []
 
 
-def item_lines(item: ReviewItem) -> List[str]:
+def anchor_lines(anchor: Anchor) -> List[str]:
     """该复习项对应的内容行（已去掉空行）。"""
-    if item.content is not None:
-        return item.content
-
-    if item.block is not None:
-        return [ln for ln in item.block.lines if ln.strip()]
+    if anchor.block is not None:
+        return [ln for ln in anchor.block.lines if ln.strip()]
 
     collected: List[str] = []
-    if item.commits:
+    if anchor.commits:
         seen = set()
-        for commit in item.commits:
-            for line in added_lines(commit, item.path):
+        for commit in anchor.commits:
+            for line in added_lines(commit, anchor.path):
                 if line in seen:
                     continue
                 seen.add(line)
                 collected.append(line)
     else:
-        collected = read_file_lines(item.path)
+        collected = read_file_lines(anchor.path)
     return [ln for ln in collected if ln.strip()]
 
 
@@ -589,26 +697,45 @@ def fmt_date(d: date) -> str:
     return "%s %s" % (d.isoformat(), WEEKDAYS[d.weekday()])
 
 
-def print_item(item: ReviewItem, lines: Sequence[str], full: bool) -> None:
-    overdue = item.due < TODAY
-    flag = "⏰ 逾期 %d 天" % (TODAY - item.due).days if overdue else "🔥 今日到期"
-    print(" [%d] %s" % (item.index, item.path))
-    print("     %s │ 位置：%s" % (flag, item.location))
+def _width(text: str) -> int:
+    """中文按 2 个宽度计算，用于对齐表格。"""
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+
+
+def _fit(text: str, width: int) -> str:
+    """按显示宽度截断并补齐空格。"""
+    text = text.replace("|", "/")
+    if _width(text) <= width:
+        return text + " " * (width - _width(text))
+    out: List[str] = []
+    used = 0
+    for ch in text:
+        w = 2 if ord(ch) > 0x2E7F else 1
+        if used + w > width - 2:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…" + " " * max(0, width - used - 2)
+
+
+def print_item(s: "Schedule", lines: Sequence[str], full: bool) -> None:
+    print(" [%d] %s" % (s.index, s.path))
+    print("     位置：%s │ 学习日期 %s" % (s.location, s.learned.isoformat()))
     print(
-        "     学习日期 %s │ 第 %d 次复习（学习后 %d 天）"
-        % (item.learned.isoformat(), item.round_no, item.interval)
+        "     第 %d 轮复习（距上一轮 %d 天）│ 计划复习日 %s"
+        % (s.round_no, s.gap, s.due.isoformat())
     )
-    if item.commits:
-        print("     来源提交：%s" % ", ".join(item.commits))
+    if s.anchor.commits:
+        print("     来源提交：%s" % ", ".join(s.anchor.commits))
 
     if not lines:
-        print("     （这里没有可显示的内容，可能是只删不改，快速回忆即可）")
+        print("     （没有可显示的内容，可能是只删不改，快速回忆一下即可）")
         print()
         return
 
     shown = lines if full else lines[:PREVIEW_LINES]
     print(
-        "     ── 要复习的内容（共 %d 行%s）──"
+        "     ── 今天要复习的内容（共 %d 行%s）──"
         % (len(lines), "" if full else "，展示前 %d 行" % len(shown))
     )
     for ln in shown:
@@ -616,6 +743,79 @@ def print_item(item: ReviewItem, lines: Sequence[str], full: bool) -> None:
     if not full and len(lines) > len(shown):
         print("       │ ...（还有 %d 行，加 --full 查看全部）" % (len(lines) - len(shown)))
     print()
+
+
+def print_overdue_table(overdue: Sequence["Schedule"]) -> None:
+    print(SUB)
+    print(" 🕒 逾期未复习：%d 项（只列清单，不展开内容）" % len(overdue))
+    print()
+    print(
+        "   "
+        + _fit("文件", TABLE_PATH_WIDTH)
+        + " "
+        + _fit("位置", TABLE_LOC_WIDTH)
+        + " "
+        + _fit("学习日期", 12)
+        + " "
+        + _fit("计划复习日", 12)
+        + " "
+        + "逾期"
+    )
+    for s in overdue:
+        print(
+            "   "
+            + _fit(s.path, TABLE_PATH_WIDTH)
+            + " "
+            + _fit(s.location, TABLE_LOC_WIDTH)
+            + " "
+            + _fit(s.learned.isoformat(), 12)
+            + " "
+            + _fit(s.due.isoformat(), 12)
+            + " "
+            + "%d 天（第 %d 轮）" % (s.overdue_days, s.round_no)
+        )
+    print()
+
+
+def write_overdue_file(overdue: Sequence["Schedule"], today: date) -> Optional[Path]:
+    """把逾期清单写成 markdown 表格；没有逾期内容时删除该文件。"""
+    path = REPO / OVERDUE_FILE
+    if not overdue:
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return None
+
+    lines = [
+        "# 逾期未复习清单",
+        "",
+        "> 更新时间：%s" % fmt_date(today),
+        "> 每次运行 `python tools/review.py` 都会重新生成。",
+        "",
+        "| 文件 | 位置 | 学习日期 | 计划复习日 | 逾期天数 | 轮次 |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for s in overdue:
+        lines.append(
+            "| `%s` | %s | %s | %s | %d 天 | 第 %d 轮 |"
+            % (s.path, s.location, s.learned.isoformat(), s.due.isoformat(), s.overdue_days, s.round_no)
+        )
+    lines += [
+        "",
+        "复习完这些内容后，执行下面的命令把它们标记为已补复习：",
+        "",
+        "```",
+        "python tools/review.py --catch-up",
+        "```",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+# ==================== 提示 ====================
 
 
 def print_hint_uncommitted() -> None:
@@ -633,43 +833,67 @@ def command_report(args: argparse.Namespace, state: Dict[str, object]) -> int:
     reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
     blocks = collect_blocks()
     events = collect_events()
-    all_items = build_all_items(events, blocks, reviewed, with_content=True)
-    items = due_items(all_items, TODAY)
+    anchors = build_anchors(events, blocks)
+    schedules = resolve_schedules(anchors, reviewed, TODAY, with_content=True)
+    todays = [s for s in schedules if s.is_today]
+    overdue = [s for s in schedules if s.overdue_days > 0]
 
     print(BAR)
-    print("   📚 艾宾浩斯复习提醒   【%s】" % fmt_date(TODAY))
+    print("   📚 今日复习   【%s】" % fmt_date(TODAY))
     print("   仓库：%s" % REPO)
     print(BAR)
 
-    if not items:
+    if todays:
         print()
-        print("   ✅ 今天没有到期的复习任务，可以自由学习新内容啦～")
+        print(" 🔥 今天要复习 %d 段内容（看完就等于今天学完了）" % len(todays))
+        for i, s in enumerate(todays, start=1):
+            s.index = i
+            print(SUB)
+            print_item(s, s.content or [], full=args.full)
+    else:
+        print()
+        print("   ✅ 今天没有到期的复习内容，去学点新东西吧～")
         print()
 
-    for i, item in enumerate(items, start=1):
-        item.index = i
-        print(SUB)
-        print_item(item, item_lines(item), full=args.full)
+    if overdue:
+        print_overdue_table(overdue)
+        if args.show_overdue:
+            print(" 📖 下面展开逾期内容的正文：")
+            for i, s in enumerate(overdue, start=1):
+                s.index = i
+                print(SUB)
+                print_item(s, s.content or [], full=args.full)
 
-    upcoming = upcoming_map(all_items, TODAY, args.upcoming)
+    upcoming = upcoming_map(schedules, TODAY, args.upcoming) if args.upcoming else []
     if upcoming:
         print(SUB)
-        print(" 📅 未来 %d 天预告（只统计数量）" % args.upcoming)
+        print(" 📅 未来 %d 天还会复习（按按时复习推算）" % args.upcoming)
         for d, paths in upcoming:
             print("     %s   %d 项" % (fmt_date(d), len(paths)))
         print()
 
     print_hint_uncommitted()
 
+    log_path = write_overdue_file(overdue, TODAY)
+
     print(SUB)
-    if items:
-        block_count = sum(1 for it in items if it.kind == "block")
+    if todays and not args.no_mark:
+        for s in todays:
+            reviewed[s.key] = TODAY.isoformat()
+        state["reviewed"] = reviewed
+        save_state(state)
         print(
-            " 本次共 %d 项待复习（内容块 %d 项 / 整篇文件 %d 项）。"
-            % (len(items), block_count, len(items) - block_count)
+            " ✅ 已记账：今天这 %d 段内容记为「%s 已复习」，明天不会再提醒。"
+            % (len(todays), TODAY.isoformat())
         )
-        print(" 复习完成后执行：python tools/review.py --done")
-    print(" 提示：--done 标记完成 / --markers 检查日期标记 / --stamp 生成时间戳")
+    elif todays:
+        print(" ℹ️  当前是「只看不记」（--no-mark），本次没有写入复习记录。")
+
+    if overdue and log_path is not None:
+        print(" 📄 逾期清单已写入 %s，复习完用 --catch-up 清掉。" % OVERDUE_FILE)
+    if not todays and not overdue:
+        print(" 🎉 目前没有任何待复习的内容。")
+    print(" 提示：--no-mark 只看不记 / --catch-up 补复习 / --status 看后续安排 / --markers 检查日期标记")
     print(BAR)
     return 0
 
@@ -678,37 +902,78 @@ def command_done(args: argparse.Namespace, state: Dict[str, object]) -> int:
     reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
     blocks = collect_blocks()
     events = collect_events()
-    items = due_items(build_all_items(events, blocks, reviewed, with_content=True), TODAY)
+    anchors = build_anchors(events, blocks)
+    todays = [
+        s
+        for s in resolve_schedules(anchors, reviewed, TODAY, with_content=True)
+        if s.is_today
+    ]
 
-    if not items:
+    if not todays:
         print("✅ 今天没有待复习的项目，无需标记。")
         return 0
 
-    for i, item in enumerate(items, start=1):
-        item.index = i
+    for i, s in enumerate(todays, start=1):
+        s.index = i
 
     if args.done == "all":
-        targets = items
+        targets = todays
     else:
         wanted = set()
         for chunk in str(args.done).split(","):
             chunk = chunk.strip()
             if chunk.isdigit():
                 wanted.add(int(chunk))
-        targets = [it for it in items if it.index in wanted]
+        targets = [s for s in todays if s.index in wanted]
         if not targets:
-            print("⚠️  没有匹配的项目，可用序号：1 ~ %d" % len(items))
+            print("⚠️  没有匹配的项目，可用序号：1 ~ %d" % len(todays))
             return 1
 
-    for item in targets:
-        reviewed[item.key] = TODAY.isoformat()
+    for s in targets:
+        reviewed[s.key] = TODAY.isoformat()
     state["reviewed"] = reviewed
     save_state(state)
 
     print("✅ 已标记 %d 项为「今天复习完成」：" % len(targets))
-    for item in targets:
-        print("   · %s（%s，第 %d 次复习）" % (item.path, item.location, item.round_no))
-    print("\n记录已保存到 %s" % state_path())
+    for s in targets:
+        print("   · %s（%s，第 %d 轮）" % (s.path, s.location, s.round_no))
+    return 0
+
+
+def command_catch_up(args: argparse.Namespace, state: Dict[str, object]) -> int:
+    """把逾期清单里的内容全部标记为「今天补复习完成」。"""
+    reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
+    blocks = collect_blocks()
+    events = collect_events()
+    anchors = build_anchors(events, blocks)
+    overdue = [
+        s
+        for s in resolve_schedules(anchors, reviewed, TODAY, with_content=True)
+        if s.overdue_days > 0
+    ]
+
+    if not overdue:
+        write_overdue_file([], TODAY)
+        print("✅ 没有逾期未复习的内容，无需补记。")
+        return 0
+
+    for s in overdue:
+        reviewed[s.key] = TODAY.isoformat()
+    state["reviewed"] = reviewed
+    save_state(state)
+    write_overdue_file([], TODAY)
+
+    print(
+        "✅ 已把 %d 项逾期内容记为「%s 补复习完成」，后续复习从今天重新往后排："
+        % (len(overdue), TODAY.isoformat())
+    )
+    for s in overdue:
+        print(
+            "   · %s（%s，第 %d 轮，原本 %s 到期，逾期 %d 天）"
+            % (s.path, s.location, s.round_no, s.due.isoformat(), s.overdue_days)
+        )
+    print()
+    print(" 现在运行 python tools/review.py 看看今天的任务吧。")
     return 0
 
 
@@ -716,38 +981,43 @@ def command_status(args: argparse.Namespace, state: Dict[str, object]) -> int:
     reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
     blocks = collect_blocks()
     events = collect_events()
-    items = build_all_items(events, blocks, reviewed)
+    anchors = build_anchors(events, blocks)
+    schedules = resolve_schedules(anchors, reviewed, TODAY, with_content=True)
 
-    next_due: Dict[str, date] = {}
-    pending_count: Dict[str, int] = {}
-    for item in items:
-        if item.path not in next_due or item.due < next_due[item.path]:
-            next_due[item.path] = item.due
-        pending_count[item.path] = pending_count.get(item.path, 0) + 1
+    by_path: Dict[str, List[Schedule]] = {}
+    for s in schedules:
+        by_path.setdefault(s.path, []).append(s)
 
     print(BAR)
-    print("   📊 各文件复习安排   【%s】" % fmt_date(TODAY))
+    print("   📊 复习安排   【%s】" % fmt_date(TODAY))
     print(BAR)
 
-    today_count = 0
-    for path in sorted(set(blocks) | set(events)):
-        if path in blocks:
-            unit = "%d 个日期块" % len(blocks[path])
+    print(
+        " · "
+        + _fit("文件", 38)
+        + " 状态"
+    )
+    today_total = overdue_total = 0
+    for path in sorted(set(a.path for a in anchors)):
+        units = by_path.get(path, [])
+        if not units:
+            print(" · " + _fit(path, 38) + " ✅ 全部复习完成")
+            continue
+        due = min(u.due for u in units)
+        today_units = sum(1 for u in units if u.is_today)
+        overdue_units = sum(1 for u in units if u.overdue_days > 0)
+        today_total += today_units
+        overdue_total += overdue_units
+        if overdue_units:
+            status = "🔔 今日 %d 段 + 逾期 %d 段" % (today_units, overdue_units)
+        elif today_units:
+            status = "🔔 今日要复习 %d 段" % today_units
         else:
-            unit = "按 git 提交（%d 次）" % len(events[path])
-        if path in next_due:
-            due = next_due[path]
-            if due <= TODAY:
-                today_count += 1
-                status = "🔔 今天该复习"
-            else:
-                status = "下次复习 %s（还有 %d 天）" % (due.isoformat(), (due - TODAY).days)
-        else:
-            status = "✅ 全部复习完毕"
-        print(" · %-38s %-18s %s" % (path, unit, status))
+            status = "%s 起复习 %d 段" % (due.isoformat(), len(units))
+        print(" · " + _fit(path, 38) + " " + status)
 
     print()
-    print(" 今天有 %d 个文件需要复习。" % today_count)
+    print(" 今天要复习 %d 段，逾期未复习 %d 段。" % (today_total, overdue_total))
     print(BAR)
     return 0
 
@@ -773,7 +1043,7 @@ def command_markers(args: argparse.Namespace, state: Dict[str, object]) -> int:
             body = len([ln for ln in block.lines if ln.strip()])
             last_due = block.learned + timedelta(days=INTERVALS[-1])
             print(
-                "    第 %d-%d 行 │ 标记 %-22s │ 学习 %s │ 内容 %d 行 │ 最后一轮 %s"
+                "    第 %d-%d 行 │ 标记 %-24s │ 学习 %s │ 内容 %d 行 │ 最后一轮 %s"
                 % (
                     block.start,
                     block.end,
@@ -792,7 +1062,10 @@ def command_stamp(args: argparse.Namespace, state: Dict[str, object]) -> int:
     now = datetime.now()
     print("把下面这一行粘贴到笔记里（单独一行）：")
     print()
-    print("    %d年%d月%d日%d:%02d:%02d" % (now.year, now.month, now.day, now.hour, now.minute, now.second))
+    print(
+        "    %d年%d月%d日%d:%02d:%02d"
+        % (now.year, now.month, now.day, now.hour, now.minute, now.second)
+    )
     print()
     return 0
 
@@ -809,6 +1082,7 @@ def command_reset(args: argparse.Namespace, state: Dict[str, object]) -> int:
             print("已取消。")
             return 1
     save_state({"reviewed": {}})
+    write_overdue_file([], TODAY)
     print("🧹 已清空 %d 条复习记录，所有内容将重新进入复习计划。" % count)
     return 0
 
@@ -822,16 +1096,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global TODAY
 
     parser = argparse.ArgumentParser(
-        description="艾宾浩斯记忆曲线复习提醒（文件内日期标记 + git 提交时间）",
+        description="艾宾浩斯复习提醒：跑一次 = 今天已学（并自动记账）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--no-mark", action="store_true",
+                        help="只看今天的复习内容，不写入复习记录")
+    parser.add_argument("--show-overdue", action="store_true",
+                        help="把逾期内容的正文也展开显示（默认只列清单）")
+    parser.add_argument("--catch-up", action="store_true",
+                        help="把逾期清单里的内容全部记为「已补复习」")
     parser.add_argument("--done", nargs="?", const="all", metavar="序号",
                         help="标记今天已复习，可指定序号，如 --done 1,3；不带参数表示全部")
     parser.add_argument("--upcoming", type=int, default=None, metavar="N",
-                        help="预告未来 N 天的复习安排（默认 %d 天）" % DEFAULT_UPCOMING)
-    parser.add_argument("--status", action="store_true", help="查看每个文件的下一次复习安排")
+                        help="预告未来 N 天的复习安排（默认 %d 天，0 表示不显示）" % DEFAULT_UPCOMING)
+    parser.add_argument("--status", action="store_true", help="查看每个文件的复习安排")
     parser.add_argument("--markers", action="store_true", help="列出识别到的日期标记（检查格式）")
-    parser.add_argument("--stamp", action="store_true", help="生成当前时间戳文本，方便粘贴进笔记")
+    parser.add_argument("--stamp", action="store_true", help="生成当前时间戳，方便粘贴进笔记")
     parser.add_argument("--reset", action="store_true", help="清空复习记录")
     parser.add_argument("--yes", action="store_true", help="--reset 时跳过确认")
     parser.add_argument("--full", action="store_true", help="显示完整内容，不截断")
@@ -857,6 +1137,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return command_stamp(args, state)
     if args.reset:
         return command_reset(args, state)
+    if args.catch_up:
+        return command_catch_up(args, state)
     if args.done:
         return command_done(args, state)
     if args.status:
