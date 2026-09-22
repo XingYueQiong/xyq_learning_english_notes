@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-艾宾浩斯复习提醒（跑一次 = 当天已学）
-=====================================
+艾宾浩斯复习提醒（手动填写是否已复习）
+===========================================
 每天跑一次这个脚本，它就会：
-    1. 把「今天该复习的内容」完整打印出来（这就是你今天的复习任务）；
-    2. 顺手把今天这些内容记为「今天已复习」，明天不会再重复提醒；
-    3. 把「逾期没复习」的内容整理成一张表格（同时写入 复习逾期清单.md）。
+    1. 算出当前需要复习的内容（包含今日到期和逾期内容）；
+    2. 把这些任务写入 复习任务表.md；
+    3. 由你自己在表格最后一列手动填写“是否已复习”。
 
 复习时间的两种来源
 ------------------
@@ -36,10 +36,7 @@
 偶尔漏了一天，后面的安排会自动顺延，不会一次冒出好几轮。
 
 用法（在仓库根目录执行）：
-    python tools/review.py                    # 今天的复习内容（并记为已复习）
-    python tools/review.py --no-mark          # 只看，不记录
-    python tools/review.py --catch-up         # 把逾期清单里的内容全部记为「已补复习」
-    python tools/review.py --done 1,3         # 只把今天第 1、3 项记为已复习
+    python tools/review.py                    # 生成 / 更新今天的复习任务表
     python tools/review.py --upcoming 14      # 未来 14 天还会复习哪些
     python tools/review.py --status           # 每段内容下一轮复习的时间
     python tools/review.py --markers          # 列出识别到的日期标记（检查格式用）
@@ -48,12 +45,13 @@
     python tools/review.py --reset            # 清空复习记录，重新开始
     python tools/review.py --date 2026-09-20  # 假装今天是某一天（测试用）
 
-复习进度保存在 .review_state.json；逾期清单会写到 复习逾期清单.md。
+复习记录保存在 复习任务表.md。
+你可以在“是否已复习”列中填写：是 / 已复习 / √ / yes。
 注意：改了文件记得 commit（或给新内容写上日期标记），脚本才知道有新东西要复习。
 """
 
 import argparse
-import json
+import hashlib
 import re
 import subprocess
 import sys
@@ -87,11 +85,14 @@ PREVIEW_LINES = 40
 # --upcoming 默认预览多少天
 DEFAULT_UPCOMING = 7
 
-# 复习记录文件名（存放在仓库根目录，已加入 .gitignore）
-STATE_FILE = ".review_state.json"
+# 复习记录表（手动填写“是否已复习”）
+REVIEW_TABLE_FILE = "复习任务表.md"
 
-# 逾期清单文件名（每次运行都会重新生成，内容为空则删除该文件）
-OVERDUE_FILE = "复习逾期清单.md"
+# 旧版逾期清单文件，当前模式不再生成，但需要忽略，避免被纳入复习内容。
+LEGACY_OVERDUE_FILE = "复习逾期清单.md"
+
+# 旧版自动记账文件。保留在忽略列表里，但当前模式不再使用。
+STATE_FILE = ".review_state.json"
 
 # 逾期表格里文件名 / 位置列的宽度
 TABLE_PATH_WIDTH = 34
@@ -99,7 +100,7 @@ TABLE_LOC_WIDTH = 24
 
 # 不纳入复习计划的目录 / 文件 / 后缀
 IGNORE_DIRS = {".git", ".vscode", ".github", ".idea", "__pycache__", "tools", "scripts"}
-IGNORE_FILES = {".gitignore", "README.md", STATE_FILE, OVERDUE_FILE}
+IGNORE_FILES = {".gitignore", "README.md", STATE_FILE, REVIEW_TABLE_FILE, LEGACY_OVERDUE_FILE}
 IGNORE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".svg",
     ".pdf", ".zip", ".7z", ".rar", ".exe", ".dll", ".mp3", ".mp4",
@@ -407,31 +408,131 @@ def uncommitted_files() -> List[str]:
     return result
 
 
-# ==================== 复习状态（本地记录） ====================
+# ==================== 复习记录表（手动填写） ====================
 
 
-def state_path() -> Path:
-    return REPO / STATE_FILE
+TABLE_HEADERS = ["文件", "内容日期", "位置", "轮次", "原计划复习日"]
+
+TRUTHY_REVIEWED = {
+    "1", "y", "yes", "true", "done", "是", "已复习", "已完成", "完成", "√", "x", "[x]"
+}
+SECTION_DATE_RE = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2})\s*$")
+SECTION_DONE_RE = re.compile(r"^当天是否已复习：\s*(.*)\s*$")
+ROUND_RE = re.compile(r"第\s*(\d+)\s*轮")
 
 
-def load_state() -> Dict[str, object]:
-    path = state_path()
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                data.setdefault("reviewed", {})
-                return data
-        except (json.JSONDecodeError, OSError):
-            print("⚠️  复习记录文件损坏，已忽略并重建。")
-    return {"reviewed": {}}
+def review_table_path() -> Path:
+    return REPO / REVIEW_TABLE_FILE
 
 
-def save_state(state: Dict[str, object]) -> None:
-    state_path().write_text(
-        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+def task_id(task_key: str) -> str:
+    return hashlib.sha1(task_key.encode("utf-8")).hexdigest()[:12]
+
+
+def is_reviewed_flag(value: str) -> bool:
+    return value.strip().lower() in TRUTHY_REVIEWED
+
+
+def split_md_row(line: str) -> List[str]:
+    if not line.strip().startswith("|"):
+        return []
+    return [part.strip() for part in line.strip().strip("|").split("|")]
+
+
+def anchor_content_date(anchor: "Anchor") -> str:
+    if anchor.block is None:
+        return anchor.learned.isoformat()
+    if anchor.block.marker_text == "（文件开头，无日期标记）":
+        return "文件开头（无日期标记）"
+    return anchor.block.stamp
+
+
+def parse_round_no(text: str) -> Optional[int]:
+    m = ROUND_RE.search(text)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def load_manual_reviews() -> Tuple[Dict[str, str], Dict[str, Dict[str, object]], List[str]]:
+    """
+    读取复习任务表，返回：
+    1. 已手动标记完成的 section {section_date: 是否已勾选}
+    2. 每天对应的记录 {date: {done, rows}}
+    3. 日期章节顺序
+    """
+    path = review_table_path()
+    if not path.exists():
+        return {}, {}, []
+
+    reviewed: Dict[str, str] = {}
+    sections: Dict[str, Dict[str, object]] = {}
+    order: List[str] = []
+    current: Optional[str] = None
+
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = SECTION_DATE_RE.match(raw.strip())
+        if m:
+            current = m.group(1)
+            if current not in sections:
+                sections[current] = {"done": "", "rows": []}
+                order.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        done_match = SECTION_DONE_RE.match(raw.strip())
+        if done_match:
+            sections[current]["done"] = done_match.group(1).strip()
+            if is_reviewed_flag(done_match.group(1)):
+                reviewed[current] = current
+            continue
+
+        cells = split_md_row(raw)
+        if len(cells) != len(TABLE_HEADERS):
+            continue
+        if cells == TABLE_HEADERS:
+            continue
+        if all(set(cell) <= {"-", ":", " "} for cell in cells):
+            continue
+
+        row = dict(zip(TABLE_HEADERS, cells))
+        rows = sections[current]["rows"]
+        assert isinstance(rows, list)
+        rows.append(row)
+
+    return reviewed, sections, order
+
+
+def save_review_table(sections: Dict[str, Dict[str, object]], order: Sequence[str]) -> None:
+    lines = [
+        "# 复习任务表",
+        "",
+        "说明：每天运行一次脚本，它会把当天需要复习的内容写到这里。",
+        "你只需要在每天标题下面填写一次“当天是否已复习”，可填：是 / 已复习 / √ / yes / [x]。",
+        "",
+    ]
+
+    for day in order:
+        section = sections.get(day, {"done": "", "rows": []})
+        rows = section.get("rows", [])
+        done = str(section.get("done", ""))
+        lines.append("## %s" % day)
+        lines.append("")
+        lines.append("当天是否已复习：%s" % done)
+        lines.append("")
+        if not rows:
+            lines.append("今天没有需要复习的内容。")
+            lines.append("")
+            continue
+        lines.append("| " + " | ".join(TABLE_HEADERS) + " |")
+        lines.append("| " + " | ".join(["---"] * len(TABLE_HEADERS)) + " |")
+        for row in rows:
+            lines.append("| " + " | ".join(row.get(header, "") for header in TABLE_HEADERS) + " |")
+        lines.append("")
+
+    review_table_path().write_text("\n".join(lines), encoding="utf-8")
 
 
 def content_key(path: str, anchor: str, interval: int) -> str:
@@ -574,6 +675,30 @@ class Schedule(object):
         return self.due > self.today
 
 
+def build_reviewed_map(
+    anchors: Sequence[Anchor], sections: Dict[str, Dict[str, object]], reviewed_days: Dict[str, str]
+) -> Dict[str, str]:
+    """把表格里的“当天是否已复习”转成 resolve_schedules 需要的 reviewed 映射。"""
+    anchor_map = {(anchor.path, anchor_content_date(anchor)): anchor for anchor in anchors}
+    reviewed: Dict[str, str] = {}
+    for day, _done_day in reviewed_days.items():
+        section = sections.get(day, {})
+        rows = section.get("rows", [])
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            round_no = parse_round_no(row.get("轮次", ""))
+            if round_no is None or round_no < 1 or round_no > len(INTERVALS):
+                continue
+            anchor = anchor_map.get((row.get("文件", ""), row.get("内容日期", "")))
+            if anchor is None:
+                continue
+            reviewed[anchor.key(INTERVALS[round_no - 1])] = day
+    return reviewed
+
+
 def resolve_schedules(
     anchors: Sequence[Anchor],
     reviewed: Dict[str, str],
@@ -626,6 +751,8 @@ def future_dues(schedule: Schedule, today: date, days: int) -> List[Tuple[date, 
     limit = today + timedelta(days=days)
     due = schedule.due
     idx = schedule.round_no - 1
+    if today < due <= limit:
+        result.append((due, schedule.round_no))
     while idx + 1 < len(INTERVALS):
         due = due + timedelta(days=INTERVALS[idx + 1] - INTERVALS[idx])
         idx += 1
@@ -645,6 +772,72 @@ def upcoming_map(
             if due > today:
                 buckets.setdefault(due, []).append(s.path)
     return [(d, paths) for d, paths in sorted(buckets.items())]
+
+
+def build_row(schedule: Schedule) -> Dict[str, str]:
+    return {
+        "文件": schedule.path,
+        "内容日期": anchor_content_date(schedule.anchor),
+        "位置": schedule.location,
+        "轮次": "第 %d 轮" % schedule.round_no,
+        "原计划复习日": schedule.due.isoformat(),
+    }
+
+
+def sort_rows(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    def key(row: Dict[str, str]) -> Tuple[str, str, str, str]:
+        return (
+            row.get("文件", ""),
+            row.get("内容日期", ""),
+            row.get("位置", ""),
+            row.get("轮次", ""),
+        )
+
+    return sorted(rows, key=key)
+
+
+def update_today_section(
+    today: date,
+    pending: Sequence[Schedule],
+    sections: Dict[str, Dict[str, object]],
+    order: List[str],
+) -> List[Dict[str, str]]:
+    day = today.isoformat()
+    if day not in sections:
+        sections[day] = {"done": "", "rows": []}
+        order.append(day)
+
+    section = sections[day]
+    done = str(section.get("done", ""))
+    rows = section.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    existing_map = {
+        (row.get("文件", ""), row.get("内容日期", ""), row.get("轮次", "")): row
+        for row in rows
+        if isinstance(row, dict)
+    }
+
+    current_keys = {
+        (schedule.path, anchor_content_date(schedule.anchor), "第 %d 轮" % schedule.round_no)
+        for schedule in pending
+    }
+    merged: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+    if is_reviewed_flag(done):
+        merged.update(existing_map)
+    else:
+        for key, row in existing_map.items():
+            if key in current_keys:
+                merged[key] = row
+
+    for schedule in pending:
+        row = build_row(schedule)
+        key = (row["文件"], row["内容日期"], row["轮次"])
+        merged[key] = row
+
+    section["rows"] = sort_rows(list(merged.values()))
+    sections[day] = section
+    return section["rows"]
 
 
 # ==================== 提取「要复习的内容」 ====================
@@ -745,76 +938,6 @@ def print_item(s: "Schedule", lines: Sequence[str], full: bool) -> None:
     print()
 
 
-def print_overdue_table(overdue: Sequence["Schedule"]) -> None:
-    print(SUB)
-    print(" 🕒 逾期未复习：%d 项（只列清单，不展开内容）" % len(overdue))
-    print()
-    print(
-        "   "
-        + _fit("文件", TABLE_PATH_WIDTH)
-        + " "
-        + _fit("位置", TABLE_LOC_WIDTH)
-        + " "
-        + _fit("学习日期", 12)
-        + " "
-        + _fit("计划复习日", 12)
-        + " "
-        + "逾期"
-    )
-    for s in overdue:
-        print(
-            "   "
-            + _fit(s.path, TABLE_PATH_WIDTH)
-            + " "
-            + _fit(s.location, TABLE_LOC_WIDTH)
-            + " "
-            + _fit(s.learned.isoformat(), 12)
-            + " "
-            + _fit(s.due.isoformat(), 12)
-            + " "
-            + "%d 天（第 %d 轮）" % (s.overdue_days, s.round_no)
-        )
-    print()
-
-
-def write_overdue_file(overdue: Sequence["Schedule"], today: date) -> Optional[Path]:
-    """把逾期清单写成 markdown 表格；没有逾期内容时删除该文件。"""
-    path = REPO / OVERDUE_FILE
-    if not overdue:
-        if path.exists():
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        return None
-
-    lines = [
-        "# 逾期未复习清单",
-        "",
-        "> 更新时间：%s" % fmt_date(today),
-        "> 每次运行 `python tools/review.py` 都会重新生成。",
-        "",
-        "| 文件 | 位置 | 学习日期 | 计划复习日 | 逾期天数 | 轮次 |",
-        "| --- | --- | --- | --- | --- | --- |",
-    ]
-    for s in overdue:
-        lines.append(
-            "| `%s` | %s | %s | %s | %d 天 | 第 %d 轮 |"
-            % (s.path, s.location, s.learned.isoformat(), s.due.isoformat(), s.overdue_days, s.round_no)
-        )
-    lines += [
-        "",
-        "复习完这些内容后，执行下面的命令把它们标记为已补复习：",
-        "",
-        "```",
-        "python tools/review.py --catch-up",
-        "```",
-        "",
-    ]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
-
-
 # ==================== 提示 ====================
 
 
@@ -830,39 +953,48 @@ def print_hint_uncommitted() -> None:
 
 
 def command_report(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
     blocks = collect_blocks()
     events = collect_events()
     anchors = build_anchors(events, blocks)
+    reviewed_days, sections, order = load_manual_reviews()
+    reviewed = build_reviewed_map(anchors, sections, reviewed_days)
     schedules = resolve_schedules(anchors, reviewed, TODAY, with_content=True)
     todays = [s for s in schedules if s.is_today]
     overdue = [s for s in schedules if s.overdue_days > 0]
+    pending = [s for s in schedules if s.due <= TODAY]
+    today_rows = update_today_section(TODAY, pending, sections, order)
+    save_review_table(sections, order)
 
     print(BAR)
     print("   📚 今日复习   【%s】" % fmt_date(TODAY))
     print("   仓库：%s" % REPO)
     print(BAR)
 
-    if todays:
-        print()
-        print(" 🔥 今天要复习 %d 段内容（看完就等于今天学完了）" % len(todays))
-        for i, s in enumerate(todays, start=1):
-            s.index = i
-            print(SUB)
-            print_item(s, s.content or [], full=args.full)
-    else:
-        print()
-        print("   ✅ 今天没有到期的复习内容，去学点新东西吧～")
-        print()
+    print()
+    print(" 已写入 %s：" % REVIEW_TABLE_FILE)
+    print("     今日到期：%d 段" % len(todays))
+    print("     逾期待补：%d 段" % len(overdue))
+    print("     今日表格行数：%d 行" % len(today_rows))
+    print()
 
-    if overdue:
-        print_overdue_table(overdue)
-        if args.show_overdue:
-            print(" 📖 下面展开逾期内容的正文：")
-            for i, s in enumerate(overdue, start=1):
-                s.index = i
-                print(SUB)
-                print_item(s, s.content or [], full=args.full)
+    if today_rows:
+        print(" 请打开 %s，在今天这一节填写：当天是否已复习：是" % REVIEW_TABLE_FILE)
+        print(" 也支持：已复习 / √ / yes / [x]")
+        print()
+        print(" 今日前 5 行预览：")
+        for row in today_rows[:5]:
+            print(
+                "   · %s | %s | %s | %s"
+                % (
+                    row["文件"],
+                    row["内容日期"],
+                    row["轮次"],
+                    row["原计划复习日"],
+                )
+            )
+    else:
+        print(" 今天没有需要写入表格的复习任务。")
+        print()
 
     upcoming = upcoming_map(schedules, TODAY, args.upcoming) if args.upcoming else []
     if upcoming:
@@ -874,114 +1006,32 @@ def command_report(args: argparse.Namespace, state: Dict[str, object]) -> int:
 
     print_hint_uncommitted()
 
-    log_path = write_overdue_file(overdue, TODAY)
-
     print(SUB)
-    if todays and not args.no_mark:
-        for s in todays:
-            reviewed[s.key] = TODAY.isoformat()
-        state["reviewed"] = reviewed
-        save_state(state)
-        print(
-            " ✅ 已记账：今天这 %d 段内容记为「%s 已复习」，明天不会再提醒。"
-            % (len(todays), TODAY.isoformat())
-        )
-    elif todays:
-        print(" ℹ️  当前是「只看不记」（--no-mark），本次没有写入复习记录。")
-
-    if overdue and log_path is not None:
-        print(" 📄 逾期清单已写入 %s，复习完用 --catch-up 清掉。" % OVERDUE_FILE)
-    if not todays and not overdue:
+    if not pending:
         print(" 🎉 目前没有任何待复习的内容。")
-    print(" 提示：--no-mark 只看不记 / --catch-up 补复习 / --status 看后续安排 / --markers 检查日期标记")
+    print(" 提示：修改 %s 里“当天是否已复习”即可 / --status 看后续安排 / --markers 检查日期标记" % REVIEW_TABLE_FILE)
     print(BAR)
     return 0
 
 
 def command_done(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
-    blocks = collect_blocks()
-    events = collect_events()
-    anchors = build_anchors(events, blocks)
-    todays = [
-        s
-        for s in resolve_schedules(anchors, reviewed, TODAY, with_content=True)
-        if s.is_today
-    ]
-
-    if not todays:
-        print("✅ 今天没有待复习的项目，无需标记。")
-        return 0
-
-    for i, s in enumerate(todays, start=1):
-        s.index = i
-
-    if args.done == "all":
-        targets = todays
-    else:
-        wanted = set()
-        for chunk in str(args.done).split(","):
-            chunk = chunk.strip()
-            if chunk.isdigit():
-                wanted.add(int(chunk))
-        targets = [s for s in todays if s.index in wanted]
-        if not targets:
-            print("⚠️  没有匹配的项目，可用序号：1 ~ %d" % len(todays))
-            return 1
-
-    for s in targets:
-        reviewed[s.key] = TODAY.isoformat()
-    state["reviewed"] = reviewed
-    save_state(state)
-
-    print("✅ 已标记 %d 项为「今天复习完成」：" % len(targets))
-    for s in targets:
-        print("   · %s（%s，第 %d 轮）" % (s.path, s.location, s.round_no))
+    print("当前模式不再通过命令自动记账。")
+    print("请打开 %s，在最后一列手动填写“是否已复习”。" % REVIEW_TABLE_FILE)
     return 0
 
 
 def command_catch_up(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    """把逾期清单里的内容全部标记为「今天补复习完成」。"""
-    reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
-    blocks = collect_blocks()
-    events = collect_events()
-    anchors = build_anchors(events, blocks)
-    overdue = [
-        s
-        for s in resolve_schedules(anchors, reviewed, TODAY, with_content=True)
-        if s.overdue_days > 0
-    ]
-
-    if not overdue:
-        write_overdue_file([], TODAY)
-        print("✅ 没有逾期未复习的内容，无需补记。")
-        return 0
-
-    for s in overdue:
-        reviewed[s.key] = TODAY.isoformat()
-    state["reviewed"] = reviewed
-    save_state(state)
-    write_overdue_file([], TODAY)
-
-    print(
-        "✅ 已把 %d 项逾期内容记为「%s 补复习完成」，后续复习从今天重新往后排："
-        % (len(overdue), TODAY.isoformat())
-    )
-    for s in overdue:
-        print(
-            "   · %s（%s，第 %d 轮，原本 %s 到期，逾期 %d 天）"
-            % (s.path, s.location, s.round_no, s.due.isoformat(), s.overdue_days)
-        )
-    print()
-    print(" 现在运行 python tools/review.py 看看今天的任务吧。")
+    print("当前模式不再通过命令自动补记逾期内容。")
+    print("请打开 %s，把对应行的“是否已复习”手动填成 是 / 已复习 / √ / yes。" % REVIEW_TABLE_FILE)
     return 0
 
 
 def command_status(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
     blocks = collect_blocks()
     events = collect_events()
     anchors = build_anchors(events, blocks)
+    reviewed_days, sections, _order = load_manual_reviews()
+    reviewed = build_reviewed_map(anchors, sections, reviewed_days)
     schedules = resolve_schedules(anchors, reviewed, TODAY, with_content=True)
 
     by_path: Dict[str, List[Schedule]] = {}
@@ -1008,8 +1058,10 @@ def command_status(args: argparse.Namespace, state: Dict[str, object]) -> int:
         overdue_units = sum(1 for u in units if u.overdue_days > 0)
         today_total += today_units
         overdue_total += overdue_units
-        if overdue_units:
+        if today_units and overdue_units:
             status = "🔔 今日 %d 段 + 逾期 %d 段" % (today_units, overdue_units)
+        elif overdue_units:
+            status = "🕒 逾期 %d 段" % overdue_units
         elif today_units:
             status = "🔔 今日要复习 %d 段" % today_units
         else:
@@ -1071,19 +1123,21 @@ def command_stamp(args: argparse.Namespace, state: Dict[str, object]) -> int:
 
 
 def command_reset(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    reviewed: Dict[str, str] = state.get("reviewed", {})  # type: ignore[assignment]
-    count = len(reviewed)
-    if not count:
+    table_exists = review_table_path().exists()
+    state_exists = (REPO / STATE_FILE).exists()
+    if not table_exists and not state_exists:
         print("复习记录本来就是空的，无需重置。")
         return 0
     if not args.yes:
-        answer = input("⚠️  确定要清空全部 %d 条复习记录吗？(y/N) " % count).strip().lower()
+        answer = input("⚠️  确定要清空复习任务表和旧记录吗？(y/N) ").strip().lower()
         if answer not in ("y", "yes"):
             print("已取消。")
             return 1
-    save_state({"reviewed": {}})
-    write_overdue_file([], TODAY)
-    print("🧹 已清空 %d 条复习记录，所有内容将重新进入复习计划。" % count)
+    if table_exists:
+        review_table_path().unlink()
+    if state_exists:
+        (REPO / STATE_FILE).unlink()
+    print("🧹 已清空复习任务表，所有内容将重新进入复习计划。")
     return 0
 
 
@@ -1096,17 +1150,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global TODAY
 
     parser = argparse.ArgumentParser(
-        description="艾宾浩斯复习提醒：跑一次 = 今天已学（并自动记账）",
+        description="艾宾浩斯复习提醒：把任务写进表格，由你手动填写是否已复习",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--no-mark", action="store_true",
-                        help="只看今天的复习内容，不写入复习记录")
+                        help="兼容旧参数：当前模式下不生效（始终写入任务表）")
     parser.add_argument("--show-overdue", action="store_true",
-                        help="把逾期内容的正文也展开显示（默认只列清单）")
+                        help="兼容旧参数：当前模式下不生效")
     parser.add_argument("--catch-up", action="store_true",
-                        help="把逾期清单里的内容全部记为「已补复习」")
+                        help="兼容旧参数：当前模式下请手动填写任务表")
     parser.add_argument("--done", nargs="?", const="all", metavar="序号",
-                        help="标记今天已复习，可指定序号，如 --done 1,3；不带参数表示全部")
+                        help="兼容旧参数：当前模式下请手动填写任务表")
     parser.add_argument("--upcoming", type=int, default=None, metavar="N",
                         help="预告未来 N 天的复习安排（默认 %d 天，0 表示不显示）" % DEFAULT_UPCOMING)
     parser.add_argument("--status", action="store_true", help="查看每个文件的复习安排")
@@ -1131,7 +1185,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not (REPO / ".git").exists():
         print("⚠️  当前目录不是 git 仓库，没有日期标记的文件将只能按文件修改时间估算。")
 
-    state = load_state()
+    state: Dict[str, object] = {}
 
     if args.stamp:
         return command_stamp(args, state)

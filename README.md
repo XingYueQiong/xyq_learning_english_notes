@@ -21,9 +21,9 @@ python tools\review.py
 ```
 
 它会：
-1. 把**今天该复习的内容完整打印出来**（这就是今天的复习任务）；
-2. 自动把今天这些内容记为「今天已复习」，明天不会再重复提醒；
-3. 如果有**逾期没复习**的，列成一张表格（同时写入 `复习逾期清单.md`），不占用屏幕。
+1. 计算**今天需要复习的内容**（包含今日到期和逾期内容）；
+2. 把这些任务写进 `复习任务表.md`；
+3. 由你自己在当天标题下面手动填写一次“当天是否已复习”。
 
 也可以直接双击仓库根目录的 `复习提醒.bat`。
 
@@ -63,26 +63,43 @@ python tools\review.py
 
 所以：改了文件记得 commit（或者给新内容补上日期标记），脚本才知道有新内容要复习。
 
-## 漏了几天怎么办
+## 每天怎么记复习
 
-逾期内容会出现在 `复习逾期清单.md` 里（控制台也会显示一张表）。  
-看完之后执行一次，把它们记为「今天补复习完成」，后续节奏从今天重新往后排：
+运行：
 
 ```
-python tools\review.py --catch-up
+python tools\review.py
 ```
+
+脚本会更新 `复习任务表.md`。你只需要打开这个文件，在当天标题下面填写：
+
+```
+当天是否已复习：是
+```
+
+也支持：
+
+```
+是
+已复习
+√
+yes
+[x]
+```
+
+脚本下次运行时，会把这一天整组任务视为“已复习”，然后自动推到下一轮。
 
 ## 其它命令
 
 ```
-python tools\review.py --no-mark      # 只看今天的复习内容，不记账
-python tools\review.py --catch-up     # 逾期内容一次性补记
 python tools\review.py --status       # 每个文件接下来的复习安排
 python tools\review.py --markers      # 列出识别到的日期标记（检查格式写对没）
 python tools\review.py --upcoming 14  # 未来 14 天的复习量
 python tools\review.py --full         # 复习内容完整显示，不截断
 python tools\review.py --reset        # 清空复习记录，重新开始
 ```
+
+说明：`--done`、`--catch-up`、`--no-mark` 是旧模式遗留参数，当前模式下不再负责自动记账。
 
 ## 一键提交（可选）
 
@@ -93,4 +110,14 @@ python tools\autocommit.py --push     # 提交后顺便推送
 
 也可以双击 `一键提交.bat`。
 
-复习进度保存在 `.review_state.json`，逾期清单在 `复习逾期清单.md`，这两个文件都不会提交到 git。
+复习任务记录保存在 `复习任务表.md`；旧版 `.review_state.json` 只为兼容保留，不再作为主记录源。
+
+## 验证脚本
+
+改完 `tools/review.py` 或 `tools/autocommit.py` 后，可以运行：
+
+```
+python -m unittest discover -s tests -v
+```
+
+目前测试覆盖：日期标记识别、相对间隔复习节奏、手动复习表解析与合并、自动提交消息生成。

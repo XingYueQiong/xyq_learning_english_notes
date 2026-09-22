@@ -143,14 +143,16 @@ def build_message(groups: "OrderedDict[str, List[str]]", when: datetime) -> str:
     title = "%s %s" % (MESSAGE_PREFIX, when.strftime("%Y-%m-%d %H:%M"))
     lines = [title, ""]
     total = 0
+    shown_total = 0
     for action, paths in groups.items():
         total += len(paths)
         shown = paths[:MAX_FILES_IN_MESSAGE]
+        shown_total += len(shown)
         for i, path in enumerate(shown):
             lines.append("- %s：%s" % (action, path))
         if len(paths) > len(shown):
             lines.append("- %s：等共 %d 个文件" % (action, len(paths)))
-    if total > len(shown):
+    if total > shown_total:
         lines.append("")
         lines.append("共计 %d 个文件变动。" % total)
     return "\n".join(lines)
