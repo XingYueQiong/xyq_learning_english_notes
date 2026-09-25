@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-艾宾浩斯复习提醒（手动填写是否已复习）
-===========================================
-每天跑一次这个脚本，它就会：
-    1. 算出当前需要复习的内容（包含今日到期和逾期内容）；
-    2. 把这些任务写入 复习任务表.md；
-    3. 由你自己在表格最后一列手动填写“是否已复习”。
+艾宾浩斯复习提醒（每日复习文档版）
+=================================
+每天跑一次这个脚本，它会：
+    1. 算出今天需要复习的内容，包含今日到期和逾期内容；
+    2. 生成一份当天的复习文档，把需要看的内容完整复制出来；
+    3. 用历史每日复习文档里的勾选状态，供下一次运行继续计算。
 
 复习时间的两种来源
 ------------------
@@ -36,18 +36,18 @@
 偶尔漏了一天，后面的安排会自动顺延，不会一次冒出好几轮。
 
 用法（在仓库根目录执行）：
-    python tools/review.py                    # 生成 / 更新今天的复习任务表
+    python tools/review.py                    # 生成 / 更新今天的复习文档
+    python tools/review.py --sync             # 兼容旧参数：当前不需要同步
     python tools/review.py --upcoming 14      # 未来 14 天还会复习哪些
     python tools/review.py --status           # 每段内容下一轮复习的时间
     python tools/review.py --markers          # 列出识别到的日期标记（检查格式用）
     python tools/review.py --stamp            # 打印当前时间戳，方便粘贴进笔记
     python tools/review.py --full             # 内容完整显示，不截断
-    python tools/review.py --reset            # 清空复习记录，重新开始
+    python tools/review.py --reset            # 清空生成文件和旧记录
     python tools/review.py --date 2026-09-20  # 假装今天是某一天（测试用）
 
-复习记录保存在 复习任务表.md。
-你可以在“是否已复习”列中填写：是 / 已复习 / √ / yes。
-注意：改了文件记得 commit（或给新内容写上日期标记），脚本才知道有新东西要复习。
+每天生成的复习文档保存在 每日复习/YYYY-MM-DD.md。
+历史每日复习文档里的勾选框会记录每个内容块已完成的轮次和完成日期。
 """
 
 import argparse
@@ -85,7 +85,10 @@ PREVIEW_LINES = 40
 # --upcoming 默认预览多少天
 DEFAULT_UPCOMING = 7
 
-# 复习记录表（手动填写“是否已复习”）
+# 每日复习文档目录
+DAILY_REVIEW_DIR = "每日复习"
+
+# 旧版复习记录表（兼容保留，不再作为主流程）
 REVIEW_TABLE_FILE = "复习任务表.md"
 
 # 旧版逾期清单文件，当前模式不再生成，但需要忽略，避免被纳入复习内容。
@@ -99,7 +102,7 @@ TABLE_PATH_WIDTH = 34
 TABLE_LOC_WIDTH = 24
 
 # 不纳入复习计划的目录 / 文件 / 后缀
-IGNORE_DIRS = {".git", ".vscode", ".github", ".idea", "__pycache__", "tools", "scripts"}
+IGNORE_DIRS = {".git", ".vscode", ".github", ".idea", "__pycache__", "tools", "scripts", DAILY_REVIEW_DIR}
 IGNORE_FILES = {".gitignore", "README.md", STATE_FILE, REVIEW_TABLE_FILE, LEGACY_OVERDUE_FILE}
 IGNORE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".svg",
@@ -535,6 +538,252 @@ def save_review_table(sections: Dict[str, Dict[str, object]], order: Sequence[st
     review_table_path().write_text("\n".join(lines), encoding="utf-8")
 
 
+REVIEW_STATE_BEGIN = "<!-- review-state"
+REVIEW_STATE_END = "-->"
+REVIEW_STATE_LINE_RE = re.compile(
+    r"^\s*(?P<key>.+?):\s*done=(?P<done>[^;]*?)"
+    r"(?:\s*;\s*remaining=(?P<remaining>.*))?\s*$"
+)
+ROUND_DONE_RE = re.compile(r"^(?P<round>\d+)@(?P<day>\d{4}-\d{2}-\d{2})$")
+
+
+def review_doc_path(day: date) -> Path:
+    return REPO / DAILY_REVIEW_DIR / ("%s.md" % day.isoformat())
+
+
+def parse_review_state(text: str) -> Dict[str, Dict[int, str]]:
+    """解析源文件末尾的 review-state 注释。"""
+    state: Dict[str, Dict[int, str]] = {}
+    in_block = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped == REVIEW_STATE_BEGIN:
+            in_block = True
+            continue
+        if in_block and stripped == REVIEW_STATE_END:
+            break
+        if not in_block or not stripped:
+            continue
+        m = REVIEW_STATE_LINE_RE.match(stripped)
+        if not m:
+            continue
+        key = m.group("key").strip()
+        done_text = m.group("done").strip()
+        if not done_text:
+            continue
+        rounds: Dict[int, str] = {}
+        for chunk in done_text.split(","):
+            piece = chunk.strip()
+            if not piece:
+                continue
+            done_match = ROUND_DONE_RE.match(piece)
+            if not done_match:
+                continue
+            rounds[int(done_match.group("round"))] = done_match.group("day")
+        if rounds:
+            state[key] = rounds
+    return state
+
+
+def review_state_to_lines(state: Dict[str, Dict[int, str]]) -> List[str]:
+    if not state:
+        return []
+
+    lines = [REVIEW_STATE_BEGIN]
+    for key in sorted(state):
+        rounds = state[key]
+        done_rounds = sorted(rounds)
+        done_text = ",".join("%d@%s" % (round_no, rounds[round_no]) for round_no in done_rounds)
+        last_done = 0
+        for round_no in range(1, len(INTERVALS) + 1):
+            if round_no in rounds:
+                last_done = round_no
+            else:
+                break
+        if last_done >= len(INTERVALS):
+            remaining = "无"
+        elif last_done == 0:
+            remaining = "第 1-%d 轮" % len(INTERVALS)
+        elif last_done + 1 == len(INTERVALS):
+            remaining = "第 %d 轮" % len(INTERVALS)
+        else:
+            remaining = "第 %d-%d 轮" % (last_done + 1, len(INTERVALS))
+        lines.append("%s: done=%s; remaining=%s" % (key, done_text, remaining))
+    lines.append(REVIEW_STATE_END)
+    return lines
+
+
+def _replace_review_state_block(text: str, state_lines: Sequence[str]) -> str:
+    block_re = re.compile(r"\n?<!-- review-state\n.*?\n-->\s*$", re.S)
+    if state_lines:
+        block = "\n\n" + "\n".join(state_lines) + "\n"
+    else:
+        block = ""
+    if block_re.search(text):
+        return block_re.sub(block, text).rstrip() + "\n"
+    if not state_lines:
+        return text.rstrip() + "\n"
+    return text.rstrip() + block
+
+
+def load_source_review_state(anchors: Sequence["Anchor"]) -> Tuple[Dict[str, str], Dict[str, Dict[str, Dict[int, str]]], Dict[str, str]]:
+    """从源文件里的 review-state 注释恢复已复习记录。"""
+    reviewed: Dict[str, str] = {}
+    file_states: Dict[str, Dict[str, Dict[int, str]]] = {}
+    file_texts: Dict[str, str] = {}
+    for path in sorted(set(anchor.path for anchor in anchors)):
+        try:
+            text = (REPO / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        file_texts[path] = text
+        file_states[path] = parse_review_state(text)
+
+    for anchor in anchors:
+        state = file_states.get(anchor.path, {})
+        rounds = state.get(anchor.anchor, {})
+        for round_no, day in rounds.items():
+            if 1 <= round_no <= len(INTERVALS):
+                reviewed[anchor.key(INTERVALS[round_no - 1])] = day
+    return reviewed, file_states, file_texts
+
+
+def save_source_review_state(
+    file_states: Dict[str, Dict[str, Dict[int, str]]],
+    file_texts: Dict[str, str],
+) -> List[str]:
+    """把更新后的 review-state 写回源文件。"""
+    updated: List[str] = []
+    for path, state in file_states.items():
+        original = file_texts.get(path)
+        if original is None:
+            continue
+        new_text = _replace_review_state_block(original, review_state_to_lines(state))
+        if new_text == original:
+            continue
+        (REPO / path).write_text(new_text, encoding="utf-8")
+        updated.append(path)
+    return updated
+
+
+def build_daily_review_doc(schedules: Sequence[Schedule], today: date) -> str:
+    items = [s for s in schedules if s.due <= today]
+    lines = [
+        "# 今日复习 %s %s" % (today.isoformat(), WEEKDAYS[today.weekday()]),
+        "",
+        "- 生成时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "- 今日到期：%d 段" % sum(1 for s in items if s.is_today),
+        "- 逾期待补：%d 段" % sum(1 for s in items if s.overdue_days > 0),
+        "",
+    ]
+
+    if not items:
+        lines.append("今天没有需要复习的内容。")
+        lines.append("")
+        return "\n".join(lines)
+
+    for index, schedule in enumerate(items, 1):
+        lines.append("## %d. %s" % (index, schedule.path))
+        lines.append("")
+        lines.append("- 位置：%s" % schedule.location)
+        lines.append("- 内容标识：%s" % schedule.anchor.anchor)
+        lines.append("- 学习日期：%s" % schedule.learned.isoformat())
+        lines.append("- 轮次：第 %d 轮" % schedule.round_no)
+        lines.append("- 计划复习日：%s" % schedule.due.isoformat())
+        if schedule.overdue_days > 0:
+            lines.append("- 逾期：%d 天" % schedule.overdue_days)
+        else:
+            lines.append("- 状态：今天到期")
+        lines.append("- [ ] 当天是否已复习")
+        lines.append("")
+        lines.append("```text")
+        body: Sequence[str]
+        if schedule.anchor.block is not None:
+            body = schedule.anchor.block.lines
+        else:
+            body = schedule.content or []
+        for line in body:
+            lines.append(line)
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_daily_review_doc(today: date, content: str) -> Path:
+    path = review_doc_path(today)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def parse_daily_review_doc(path: Path) -> List[Tuple[str, str, int]]:
+    """从当天复习文档里提取被勾选的条目。返回 (path, anchor_key, round_no)。"""
+    if not path.exists():
+        return []
+
+    items: List[Tuple[str, str, int]] = []
+    current_path = ""
+    current_anchor = ""
+    current_round: Optional[int] = None
+    current_checked = False
+
+    def flush() -> None:
+        nonlocal current_path, current_anchor, current_round, current_checked
+        if current_checked and current_path and current_anchor and current_round is not None:
+            items.append((current_path, current_anchor, current_round))
+        current_path = ""
+        current_anchor = ""
+        current_round = None
+        current_checked = False
+
+    heading_re = re.compile(r"^##\s+\d+\.\s+(?P<path>.+)$")
+    round_re = re.compile(r"^-\s+轮次：第\s*(?P<round>\d+)\s*轮\s*$")
+    anchor_re = re.compile(r"^-\s+内容标识：(?P<anchor>.+)$")
+
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw.strip()
+        heading = heading_re.match(stripped)
+        if heading:
+            flush()
+            current_path = heading.group("path").strip()
+            continue
+        if not current_path:
+            continue
+        if stripped == "- [x] 当天是否已复习":
+            current_checked = True
+            continue
+        round_match = round_re.match(stripped)
+        if round_match:
+            current_round = int(round_match.group("round"))
+            continue
+        anchor_match = anchor_re.match(stripped)
+        if anchor_match:
+            current_anchor = anchor_match.group("anchor").strip()
+            continue
+
+    flush()
+    return items
+
+
+def load_reviewed_from_daily_docs(today: date) -> Dict[str, str]:
+    """从历史每日复习文档里恢复已完成的轮次。"""
+    reviewed: Dict[str, str] = {}
+    review_dir = REPO / DAILY_REVIEW_DIR
+    if not review_dir.exists():
+        return reviewed
+
+    for path in sorted(review_dir.glob("*.md")):
+        try:
+            doc_day = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if doc_day >= today:
+            continue
+        for item_path, anchor_key, round_no in parse_daily_review_doc(path):
+            reviewed["%s@%s#%d" % (item_path, anchor_key, round_no)] = doc_day.isoformat()
+    return reviewed
+
+
 def content_key(path: str, anchor: str, interval: int) -> str:
     """复习记录里的一项：文件 + 内容标识 + 第几轮对应的间隔。"""
     return "%s@%s#%d" % (path, anchor, interval)
@@ -956,45 +1205,43 @@ def command_report(args: argparse.Namespace, state: Dict[str, object]) -> int:
     blocks = collect_blocks()
     events = collect_events()
     anchors = build_anchors(events, blocks)
-    reviewed_days, sections, order = load_manual_reviews()
-    reviewed = build_reviewed_map(anchors, sections, reviewed_days)
+    reviewed = load_reviewed_from_daily_docs(TODAY)
     schedules = resolve_schedules(anchors, reviewed, TODAY, with_content=True)
-    todays = [s for s in schedules if s.is_today]
-    overdue = [s for s in schedules if s.overdue_days > 0]
     pending = [s for s in schedules if s.due <= TODAY]
-    today_rows = update_today_section(TODAY, pending, sections, order)
-    save_review_table(sections, order)
+    todays = [s for s in pending if s.is_today]
+    overdue = [s for s in pending if s.overdue_days > 0]
+    doc = build_daily_review_doc(pending, TODAY)
+    doc_path = write_daily_review_doc(TODAY, doc)
 
     print(BAR)
-    print("   📚 今日复习   【%s】" % fmt_date(TODAY))
+    print("   📚 今日复习文档   【%s】" % fmt_date(TODAY))
     print("   仓库：%s" % REPO)
     print(BAR)
 
     print()
-    print(" 已写入 %s：" % REVIEW_TABLE_FILE)
+    print(" 已写入 %s：" % doc_path.relative_to(REPO))
     print("     今日到期：%d 段" % len(todays))
     print("     逾期待补：%d 段" % len(overdue))
-    print("     今日表格行数：%d 行" % len(today_rows))
+    print("     今日复习项：%d 段" % len(pending))
     print()
 
-    if today_rows:
-        print(" 请打开 %s，在今天这一节填写：当天是否已复习：是" % REVIEW_TABLE_FILE)
-        print(" 也支持：已复习 / √ / yes / [x]")
-        print()
-        print(" 今日前 5 行预览：")
-        for row in today_rows[:5]:
-            print(
-                "   · %s | %s | %s | %s"
-                % (
-                    row["文件"],
-                    row["内容日期"],
-                    row["轮次"],
-                    row["原计划复习日"],
-                )
-            )
-    else:
+    if not pending:
         print(" 今天没有需要写入表格的复习任务。")
         print()
+    else:
+        print(" 请打开 %s，把当天是否已复习勾上；脚本会用历史每日文档记录进度。" % doc_path.relative_to(REPO))
+        print()
+        print(" 今日前 5 项预览：")
+        for schedule in pending[:5]:
+            print(
+                "   · %s | %s | 第 %d 轮 | %s"
+                % (
+                    schedule.path,
+                    schedule.location,
+                    schedule.round_no,
+                    schedule.due.isoformat(),
+                )
+            )
 
     upcoming = upcoming_map(schedules, TODAY, args.upcoming) if args.upcoming else []
     if upcoming:
@@ -1009,29 +1256,29 @@ def command_report(args: argparse.Namespace, state: Dict[str, object]) -> int:
     print(SUB)
     if not pending:
         print(" 🎉 目前没有任何待复习的内容。")
-    print(" 提示：修改 %s 里“当天是否已复习”即可 / --status 看后续安排 / --markers 检查日期标记" % REVIEW_TABLE_FILE)
+    print(" 提示：打开当天文档勾选完成后，下一次运行会自动参考历史每日文档 / --status 看后续安排 / --markers 检查日期标记")
     print(BAR)
     return 0
 
 
-def command_done(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    print("当前模式不再通过命令自动记账。")
-    print("请打开 %s，在最后一列手动填写“是否已复习”。" % REVIEW_TABLE_FILE)
+def command_sync(args: argparse.Namespace, state: Dict[str, object]) -> int:
+    print("不需要回写进度。当天复习只看每日复习文档里的勾选框。")
     return 0
+
+
+def command_done(args: argparse.Namespace, state: Dict[str, object]) -> int:
+    return command_sync(args, state)
 
 
 def command_catch_up(args: argparse.Namespace, state: Dict[str, object]) -> int:
-    print("当前模式不再通过命令自动补记逾期内容。")
-    print("请打开 %s，把对应行的“是否已复习”手动填成 是 / 已复习 / √ / yes。" % REVIEW_TABLE_FILE)
-    return 0
+    return command_sync(args, state)
 
 
 def command_status(args: argparse.Namespace, state: Dict[str, object]) -> int:
     blocks = collect_blocks()
     events = collect_events()
     anchors = build_anchors(events, blocks)
-    reviewed_days, sections, _order = load_manual_reviews()
-    reviewed = build_reviewed_map(anchors, sections, reviewed_days)
+    reviewed, _file_states, _file_texts = load_source_review_state(anchors)
     schedules = resolve_schedules(anchors, reviewed, TODAY, with_content=True)
 
     by_path: Dict[str, List[Schedule]] = {}
@@ -1042,11 +1289,7 @@ def command_status(args: argparse.Namespace, state: Dict[str, object]) -> int:
     print("   📊 复习安排   【%s】" % fmt_date(TODAY))
     print(BAR)
 
-    print(
-        " · "
-        + _fit("文件", 38)
-        + " 状态"
-    )
+    print(" · " + _fit("文件", 38) + " 状态")
     today_total = overdue_total = 0
     for path in sorted(set(a.path for a in anchors)):
         units = by_path.get(path, [])
@@ -1124,20 +1367,31 @@ def command_stamp(args: argparse.Namespace, state: Dict[str, object]) -> int:
 
 def command_reset(args: argparse.Namespace, state: Dict[str, object]) -> int:
     table_exists = review_table_path().exists()
+    daily_dir = REPO / DAILY_REVIEW_DIR
     state_exists = (REPO / STATE_FILE).exists()
-    if not table_exists and not state_exists:
+    if not table_exists and not state_exists and not daily_dir.exists():
         print("复习记录本来就是空的，无需重置。")
         return 0
     if not args.yes:
-        answer = input("⚠️  确定要清空复习任务表和旧记录吗？(y/N) ").strip().lower()
+        answer = input("⚠️  确定要清空生成的复习文档和旧记录吗？(y/N) ").strip().lower()
         if answer not in ("y", "yes"):
             print("已取消。")
             return 1
+    if daily_dir.exists():
+        for path in daily_dir.glob("*.md"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            daily_dir.rmdir()
+        except OSError:
+            pass
     if table_exists:
         review_table_path().unlink()
     if state_exists:
         (REPO / STATE_FILE).unlink()
-    print("🧹 已清空复习任务表，所有内容将重新进入复习计划。")
+    print("🧹 已清空生成的复习文档和旧记录。源文件里的 review-state 注释不会被自动修改。")
     return 0
 
 
@@ -1150,17 +1404,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global TODAY
 
     parser = argparse.ArgumentParser(
-        description="艾宾浩斯复习提醒：把任务写进表格，由你手动填写是否已复习",
+        description="艾宾浩斯复习提醒：生成当天复习文档，并从历史每日文档恢复进度",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--no-mark", action="store_true",
-                        help="兼容旧参数：当前模式下不生效（始终写入任务表）")
-    parser.add_argument("--show-overdue", action="store_true",
-                        help="兼容旧参数：当前模式下不生效")
-    parser.add_argument("--catch-up", action="store_true",
-                        help="兼容旧参数：当前模式下请手动填写任务表")
+    parser.add_argument("--sync", action="store_true", help="兼容旧参数：当前不需要同步")
+    parser.add_argument("--catch-up", action="store_true", help="兼容旧参数：等同于 --sync")
     parser.add_argument("--done", nargs="?", const="all", metavar="序号",
-                        help="兼容旧参数：当前模式下请手动填写任务表")
+                        help="兼容旧参数：等同于 --sync")
     parser.add_argument("--upcoming", type=int, default=None, metavar="N",
                         help="预告未来 N 天的复习安排（默认 %d 天，0 表示不显示）" % DEFAULT_UPCOMING)
     parser.add_argument("--status", action="store_true", help="查看每个文件的复习安排")
@@ -1191,6 +1441,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return command_stamp(args, state)
     if args.reset:
         return command_reset(args, state)
+    if args.sync:
+        return command_sync(args, state)
     if args.catch_up:
         return command_catch_up(args, state)
     if args.done:

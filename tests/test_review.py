@@ -158,6 +158,80 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(rows[0]["文件"], "Word/example.md")
         self.assertEqual(rows[0]["内容日期"], "2026-09-15")
 
+    def test_load_reviewed_from_daily_docs_uses_history_before_today(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_repo = review.REPO
+            try:
+                review.REPO = Path(tmp)
+                daily_dir = review.REPO / review.DAILY_REVIEW_DIR
+                daily_dir.mkdir(parents=True, exist_ok=True)
+                (daily_dir / "2026-09-22.md").write_text(
+                    "# 今日复习 2026-09-22 星期二\n\n"
+                    "## 1. Grammar/example.md\n\n"
+                    "- 位置：第 1 行\n"
+                    "- 内容标识：2026-09-15 18:02:27\n"
+                    "- 学习日期：2026-09-15\n"
+                    "- 轮次：第 1 轮\n"
+                    "- 计划复习日：2026-09-16\n"
+                    "- [x] 当天是否已复习\n\n"
+                    "```text\n第一段内容\n```\n",
+                    encoding="utf-8",
+                )
+                anchor = review.Anchor(
+                    path="Grammar/example.md",
+                    learned=date(2026, 9, 15),
+                    anchor="2026-09-15 18:02:27",
+                    kind="block",
+                    content=["第一段内容"],
+                )
+                reviewed = review.load_reviewed_from_daily_docs(date(2026, 9, 23))
+                self.assertEqual(reviewed, {anchor.key(1): "2026-09-22"})
+            finally:
+                review.REPO = old_repo
+
+    def test_build_daily_review_doc_copies_full_content(self):
+        anchor = review.Anchor(
+            path="Sentence/example.md",
+            learned=date(2026, 9, 15),
+            anchor="2026-09-15 18:02:27",
+            kind="block",
+            content=["第一行", "第二行"],
+        )
+        schedule = review.resolve_schedules([anchor], {}, date(2026, 9, 16), with_content=True)[0]
+        doc = review.build_daily_review_doc([schedule], date(2026, 9, 16))
+        self.assertIn("# 今日复习 2026-09-16", doc)
+        self.assertIn("- [ ] 当天是否已复习", doc)
+        self.assertIn("第一行", doc)
+        self.assertIn("第二行", doc)
+
+    def test_parse_daily_review_doc_returns_only_checked_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "2026-09-16.md"
+            path.write_text(
+                "# 今日复习 2026-09-16 星期三\n\n"
+                "## 1. Word/example.md\n\n"
+                "- 位置：整篇（按 git 提交时间）\n"
+                "- 内容标识：2026-09-15\n"
+                "- 学习日期：2026-09-15\n"
+                "- 轮次：第 1 轮\n"
+                "- 计划复习日：2026-09-16\n"
+                "- [x] 当天是否已复习\n\n"
+                "```text\nexample\n```\n\n"
+                "## 2. Word/other.md\n\n"
+                "- 位置：整篇（按 git 提交时间）\n"
+                "- 内容标识：2026-09-14\n"
+                "- 学习日期：2026-09-14\n"
+                "- 轮次：第 1 轮\n"
+                "- 计划复习日：2026-09-16\n"
+                "- [ ] 当天是否已复习\n\n"
+                "```text\nother\n```\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                review.parse_daily_review_doc(path),
+                [("Word/example.md", "2026-09-15", 1)],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
